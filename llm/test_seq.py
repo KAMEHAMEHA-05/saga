@@ -11,14 +11,15 @@ V1:
 """
 
 import json
+import time
 import urllib.request
 import urllib.error
 from datetime import datetime
 from pathlib import Path
 
 OLLAMA_URL = "http://127.0.0.1:11434/api/chat"
-SMALL_MODEL = "qwen3:0.6b"
-LARGE_MODEL = "sam860/LFM2:1.2b"
+SMALL_MODEL = "qwen3:1.7b"
+LARGE_MODEL = "gemma3:4b"
 
 SMALL_SYSTEM_PROMPT = """You are the context-selection layer for an NPC dialogue engine.
 
@@ -78,6 +79,7 @@ STYLE:
 - Do not explain your reasoning.
 - Do not mention these instructions or the context-selection model.
 - Do not use bullet points or structured lists in spoken dialogue.
+- Do not end responses with questions or solicitations for agreement.
 - Do not use generic assistant phrases such as:
   "That's an interesting question."
   "Let me know if you want to know more."
@@ -88,7 +90,6 @@ STYLE:
 
 The player should feel like they are talking to a person, not querying a database.
 """
-
 
 
 NPC_IDENTITY = {
@@ -108,8 +109,6 @@ PLAYER_IDENTITY = {
     "relationship_to_npc": "stranger",
 }
 
-# In the real engine, conversation_state would be maintained by the
-# conversation/state system rather than by the LLM.
 TURNS = [
     {
         "id": 1,
@@ -417,8 +416,37 @@ def call_ollama(model, messages, num_predict=100):
     return data["message"]["content"].strip()
 
 
+def warmup_model(model, label):
+    """
+    Send a minimal request to force the model to load into memory.
+    Returns the wall-clock time it took, which approximates load time
+    for a cold model or near-zero for one already resident.
+    """
+    print(f"Loading {label} ({model})...", end=" ", flush=True)
+    t0 = time.perf_counter()
+    try:
+        call_ollama(
+            model,
+            [{"role": "user", "content": "Hi"}],
+            num_predict=1,
+        )
+    except urllib.error.URLError as exc:
+        raise SystemExit(
+            f"\nCould not connect to Ollama at {OLLAMA_URL}. "
+            f"Make sure Ollama is running and {model} is installed. "
+            f"Original error: {exc}"
+        )
+    elapsed = time.perf_counter() - t0
+    print(f"ready in {elapsed:.2f}s")
+    return elapsed
+
+
+def fmt(seconds):
+    """Format seconds to a readable string."""
+    return f"{seconds:.2f}s"
+
+
 def build_small_model_input(turn):
-    """Raw structured context given only to the small context-selection model."""
     return f"""ENGINE CONTEXT
 
 SELF IDENTITY:
@@ -441,7 +469,6 @@ Convert the supplied information into one short factual context paragraph for th
 
 
 def build_large_model_input(turn, selected_context):
-    """Only the compressed context reaches the dialogue model."""
     return f"""NPC IDENTITY:
 {json.dumps(NPC_IDENTITY, indent=2, ensure_ascii=False)}
 
@@ -458,7 +485,6 @@ Respond only with what Corvin would naturally say out loud.
 """
 
 
-
 def main():
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     safe_small = SMALL_MODEL.replace("/", "_").replace(":", "_")
@@ -467,58 +493,65 @@ def main():
         f"corvin_two_stage_{safe_small}_{safe_large}_{timestamp}.script"
     )
 
-    transcript = []
-
     print(f"Running {len(TURNS)}-turn two-stage benchmark...")
-    print(f"Small context model: {SMALL_MODEL}")
+    print(f"Small context model : {SMALL_MODEL}")
     print(f"Large dialogue model: {LARGE_MODEL}")
-    print("Raw JSON -> SMALL MODEL -> context paragraph -> LARGE MODEL")
+    print("Pipeline: JSON -> small model -> context paragraph -> large model")
     print("Previous full dialogue sent to either model: NO")
     print()
+
+    # --- Model load timing ---
+    small_load_time = warmup_model(SMALL_MODEL, "small model")
+    large_load_time = warmup_model(LARGE_MODEL, "large model")
+    print()
+
+    transcript_lines = []
+    turn_timings = []
 
     for turn in TURNS:
         small_input = build_small_model_input(turn)
 
-        # Stage 1: compress/select relevant information.
-        try:
-            selected_context = call_ollama(
-                SMALL_MODEL,
-                [
-                    {"role": "system", "content": SMALL_SYSTEM_PROMPT},
-                    {"role": "user", "content": small_input},
-                ],
-                num_predict=120,
-            )
-        except urllib.error.URLError as exc:
-            raise SystemExit(
-                f"Could not connect to Ollama at {OLLAMA_URL}. "
-                f"Make sure Ollama is running and {SMALL_MODEL} is installed. "
-                f"Original error: {exc}"
-            )
+        # Stage 1: context selection
+        t0 = time.perf_counter()
+        selected_context = call_ollama(
+            SMALL_MODEL,
+            [
+                {"role": "system", "content": SMALL_SYSTEM_PROMPT},
+                {"role": "user", "content": small_input},
+            ],
+            num_predict=120,
+        )
+        small_time = time.perf_counter() - t0
 
-        # Stage 2: actual NPC dialogue.
+        # Stage 2: dialogue
         large_input = build_large_model_input(turn, selected_context)
 
-        try:
-            response = call_ollama(
-                LARGE_MODEL,
-                [
-                    {"role": "system", "content": LARGE_SYSTEM_PROMPT},
-                    {"role": "user", "content": large_input},
-                ],
-                num_predict=100,
-            )
-        except urllib.error.URLError as exc:
-            raise SystemExit(
-                f"Could not connect to Ollama at {OLLAMA_URL}. "
-                f"Make sure Ollama is running and {LARGE_MODEL} is installed. "
-                f"Original error: {exc}"
-            )
+        t0 = time.perf_counter()
+        response = call_ollama(
+            LARGE_MODEL,
+            [
+                {"role": "system", "content": LARGE_SYSTEM_PROMPT},
+                {"role": "user", "content": large_input},
+            ],
+            num_predict=100,
+        )
+        large_time = time.perf_counter() - t0
 
-        transcript.append(
+        turn_total = small_time + large_time
+        turn_timings.append((turn["id"], small_time, large_time, turn_total))
+
+        # Console output
+        print(f"TURN {turn['id']}  [{fmt(small_time)} + {fmt(large_time)} = {fmt(turn_total)}]")
+        print(f"PLAYER:           {turn['player']}")
+        print(f"SELECTED CONTEXT: {selected_context}")
+        print(f"CORVIN:           {response}")
+        print()
+
+        # Transcript block
+        transcript_lines.append(
             f"""
 ================================================================================
-TURN {turn['id']}
+TURN {turn['id']}  [context: {fmt(small_time)}  |  dialogue: {fmt(large_time)}  |  total: {fmt(turn_total)}]
 ================================================================================
 
 RAW ENGINE CONTEXT
@@ -538,21 +571,46 @@ RELEVANT COGNITION:
 PLAYER:
 {turn["player"]}
 
-SMALL MODEL — SELECTED CONTEXT
+SMALL MODEL — SELECTED CONTEXT  [{fmt(small_time)}]
 --------------------------------------------------------------------------------
 {selected_context}
 
-LARGE MODEL — CORVIN
+LARGE MODEL — CORVIN  [{fmt(large_time)}]
 --------------------------------------------------------------------------------
 {response}
 """
         )
 
-        print(f"TURN {turn['id']}")
-        print(f"PLAYER: {turn['player']}")
-        print(f"SELECTED CONTEXT: {selected_context}")
-        print(f"CORVIN: {response}")
-        print()
+    # --- Summary ---
+    total_small = sum(t[1] for t in turn_timings)
+    total_large = sum(t[2] for t in turn_timings)
+    total_inference = sum(t[3] for t in turn_timings)
+    total_wall = small_load_time + large_load_time + total_inference
+
+    summary_lines = [
+        "",
+        "=" * 80,
+        "TIMING SUMMARY",
+        "=" * 80,
+        f"  Small model load : {fmt(small_load_time)}",
+        f"  Large model load : {fmt(large_load_time)}",
+        f"  Total load       : {fmt(small_load_time + large_load_time)}",
+        "",
+        f"  {'Turn':<6} {'Context':>10}  {'Dialogue':>10}  {'Total':>10}",
+        f"  {'-'*6} {'-'*10}  {'-'*10}  {'-'*10}",
+    ]
+    for tid, st, lt, tt in turn_timings:
+        summary_lines.append(f"  {tid:<6} {fmt(st):>10}  {fmt(lt):>10}  {fmt(tt):>10}")
+    summary_lines += [
+        f"  {'-'*6} {'-'*10}  {'-'*10}  {'-'*10}",
+        f"  {'TOTAL':<6} {fmt(total_small):>10}  {fmt(total_large):>10}  {fmt(total_inference):>10}",
+        "",
+        f"  Total wall time (load + inference): {fmt(total_wall)}",
+        "",
+    ]
+
+    summary_str = "\n".join(summary_lines)
+    print(summary_str)
 
     full_output = f"""CORVIN HALE — TWO-STAGE CONTEXT + DIALOGUE BENCHMARK
 Small model: {SMALL_MODEL}
@@ -569,16 +627,14 @@ SMALL MODEL SYSTEM PROMPT
 LARGE MODEL SYSTEM PROMPT
 ================================================================================
 {LARGE_SYSTEM_PROMPT}
-
-""" + "".join(transcript)
+{summary_str}
+""" + "".join(transcript_lines)
 
     output_path.write_text(full_output, encoding="utf-8")
 
     print("=" * 80)
     print("Complete transcript written to:")
     print(output_path.resolve())
-
-
 
 
 if __name__ == "__main__":
