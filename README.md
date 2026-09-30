@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="public/logo.png" alt="Saga" width="100%">
+  <img src="public/logo_trans.png" alt="Saga" width="100%">
 </p>
 
 # Saga
